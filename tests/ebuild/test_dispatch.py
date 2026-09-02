@@ -63,6 +63,18 @@ class TestDetectBackend:
 
 # ── BackendDispatcher — unknown backend ─────────────────────
 
+class TestConfigureBackends:
+    """Verify configure() handles supported backends correctly."""
+
+    @pytest.mark.parametrize("backend", ["cargo", "make", "kbuild", "ninja"])
+    @patch("ebuild.build.dispatch.subprocess")
+    def test_no_configure_backends_are_noop(
+        self, mock_sub, tmp_path, backend
+    ):
+        d = BackendDispatcher(tmp_path, tmp_path / "build")
+        d.configure(backend)
+        mock_sub.run.assert_not_called()
+
 
 class TestUnknownBackend:
     """Unknown backends must raise ValueError rather than silently skip."""
