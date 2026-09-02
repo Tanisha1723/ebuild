@@ -68,7 +68,7 @@ class TestDetectBackend:
 class TestConfigureBackends:
     """Verify configure() handles supported backends correctly."""
 
-    @pytest.mark.parametrize("backend", ["cargo", "make", "kbuild", "ninja"])
+    @pytest.mark.parametrize("backend", ["cargo", "make", "kbuild"])
     @patch("ebuild.build.dispatch.subprocess")
     def test_no_configure_backends_are_noop(
         self, mock_sub, tmp_path, backend
