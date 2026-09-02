@@ -19,17 +19,28 @@ EBUILD_CONFIG_PATH = EBUILD_HOME / "config.yaml"
 # Default repo URLs (same as eos_project_generator.py)
 DEFAULT_EOS_REPO_URL = "https://github.com/embeddedos-org/eos.git"
 DEFAULT_EBOOT_REPO_URL = "https://github.com/embeddedos-org/eBoot.git"
+DEFAULT_EFIRMWARE_REPO_URL = "https://github.com/embeddedos-org/eFirmware.git"
 
 DEFAULT_CONFIG = {
     "repos": {
+        # Both repos default to master; neither has a main. Cloning the
+        # branch named here is what `ebuild setup` does first, so "main"
+        # failed it for every new developer before any build ran.
         "eos": {
             "url": DEFAULT_EOS_REPO_URL,
-            "branch": "main",
+            "branch": "master",
             "path": None,
         },
         "eboot": {
             "url": DEFAULT_EBOOT_REPO_URL,
-            "branch": "main",
+            "branch": "master",
+            "path": None,
+        },
+        # §29 ends the development-to-device flow at an eFirmware artifact.
+        # `ebuild package` needs efwtool from this checkout to produce one.
+        "efirmware": {
+            "url": DEFAULT_EFIRMWARE_REPO_URL,
+            "branch": "master",
             "path": None,
         },
     },

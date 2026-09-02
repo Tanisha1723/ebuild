@@ -13,7 +13,7 @@ import logging
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,70 @@ TIER_2 = {"cmake", "meson"}
 TIER_3 = {"cargo"}
 
 ALL_BACKENDS = {"cmake", "make", "meson", "cargo", "kbuild", "ninja"}
+SUPPORTED_BACKENDS = TIER_1 | TIER_2 | TIER_3
+
+
+def ninja_command():
+    """Return the argv prefix that runs ninja on this machine.
+
+    Prefer a `ninja` executable on PATH -- that is what a developer who
+    followed any ordinary install guide has, and what CMake and Meson already
+    use. Fall back to the `ninja` PyPI wheel only when no binary is present.
+
+    ebuild used to invoke `sys.executable -m ninja` unconditionally, so a
+    machine with ninja correctly installed still failed with "No module named
+    ninja" on the first build of a new project.
+    """
+    import shutil
+
+    exe = shutil.which("ninja")
+    return [exe] if exe else [sys.executable, "-m", "ninja"]
+
+#: Backends ``BackendDispatcher`` accepts, per step. ``ninja`` is absent from
+#: configure/build on purpose: ebuild's own Ninja backend is driven directly by
+#: the CLI (see ``NinjaBackend``), never through this dispatcher. ``clean``
+#: still accepts it because removing a stale ``_build/`` needs no toolchain.
+CONFIGURE_BACKENDS = {"cmake", "meson", "cargo", "make", "kbuild"}
+
+BUILD_BACKENDS = {"cmake", "make", "meson", "cargo", "kbuild"}
+
+CLEAN_BACKENDS = {"cmake", "make", "meson", "cargo", "kbuild", "ninja"}
+
+
+class UnknownBackendError(ValueError, RuntimeError):
+    """Raised when a backend name is not handled by ``BackendDispatcher``.
+
+    Inherits from both :class:`ValueError` and :class:`RuntimeError` because
+    the two behaviours this consolidates were introduced independently and
+    both are depended on: callers (and the CLI's ``except RuntimeError``
+    handler, which turns this into a clean ``exit 1`` instead of a traceback)
+    may catch either. New code should catch ``UnknownBackendError``.
+    """
+
+
+#: The name this error carried before the two mechanisms were consolidated.
+#: Kept so callers and tests that import it keep working.
+BackendError = UnknownBackendError
+
+def _unknown_backend(backend: str, action: str, supported: set) -> UnknownBackendError:
+    """Build the error raised for a backend a step cannot handle.
+
+    Args:
+        backend: The rejected backend name.
+        action: Verb phrase naming the step, e.g. ``"configure"``.
+        supported: Backend names the step does accept.
+    """
+    message = (
+        f"Unknown build backend '{backend}'. "
+        f"BackendDispatcher can {action}: {', '.join(sorted(supported))}."
+    )
+    if backend == "ninja":
+        message += (
+            " ebuild's own ninja backend is invoked directly rather than "
+            "through BackendDispatcher, and requires 'targets' in build.yaml "
+            "-- add targets or choose another backend."
+        )
+    return UnknownBackendError(message)
 
 
 def detect_backend(source_dir: Path) -> str:
@@ -100,8 +164,15 @@ class BackendDispatcher:
             dry_run: If True, log commands instead of executing them.
 
         Raises:
-            ValueError: If the backend is not recognized.
+            UnknownBackendError: If this step does not handle the backend.
         """
+        # Reject before any side effect. The removed duplicate validation
+        # ran ahead of the mkdir below; raising only from the else branch
+        # left a stray build directory behind for a backend this step
+        # never handles.
+        if backend not in CONFIGURE_BACKENDS:
+            raise _unknown_backend(backend, "configure", CONFIGURE_BACKENDS)
+
         config = config or {}
         self.build_dir.mkdir(parents=True, exist_ok=True)
 
@@ -118,19 +189,11 @@ class BackendDispatcher:
             cmd = ["meson", "setup", str(self.build_dir), str(self.source_dir)]
             _run_or_log(cmd, dry_run)
 
-        elif backend == "cargo":
-            pass  # Cargo does not have a separate configure step
-
-        elif backend in ("make", "kbuild", "ninja"):
-            pass  # No separate configure step
+        elif backend in ("cargo", "make", "kbuild"):
+            pass  # These backends have no separate configure step.
 
         else:
-            raise ValueError(
-                f"Unknown build backend '{backend}'. "
-                f"Supported backends: {', '.join(sorted(ALL_BACKENDS))}"
-            )
-
-
+            raise _unknown_backend(backend, "configure", CONFIGURE_BACKENDS)
 
     def build(
         self,
@@ -147,7 +210,7 @@ class BackendDispatcher:
             dry_run: If True, log commands instead of executing them.
 
         Raises:
-            ValueError: If the backend is not recognized.
+            UnknownBackendError: If this step does not handle the backend.
         """
         config = config or {}
 
@@ -178,10 +241,7 @@ class BackendDispatcher:
             _run_or_log(cmd, dry_run)
 
         else:
-            raise ValueError(
-                f"Unknown build backend '{backend}'. "
-                f"Supported backends: {', '.join(sorted(ALL_BACKENDS))}"
-            )
+            raise _unknown_backend(backend, "build", BUILD_BACKENDS)
 
     def clean(
         self,
@@ -196,7 +256,7 @@ class BackendDispatcher:
             dry_run: If True, log commands instead of executing them.
 
         Raises:
-            ValueError: If the backend is not recognized.
+            UnknownBackendError: If this step does not handle the backend.
         """
         if backend == "cmake":
             _run_or_log(
@@ -225,12 +285,9 @@ class BackendDispatcher:
             )
         elif backend == "ninja":
             _run_or_log(
-                [sys.executable, "-m", "ninja", "-C", str(self.build_dir), "-t", "clean"],
+                ninja_command() + ["-C", str(self.build_dir), "-t", "clean"],
                 dry_run,
                 check=False,
             )
         else:
-            raise ValueError(
-                f"Unknown build backend '{backend}'. "
-                f"Supported backends: {', '.join(sorted(ALL_BACKENDS))}"
-            )
+            raise _unknown_backend(backend, "clean", CLEAN_BACKENDS)

@@ -9,6 +9,7 @@ Generates build.ninja and compile_commands.json from a ProjectConfig.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +29,45 @@ class PackagePaths:
 # present (or explicitly disabled with -fno-*) we must not add -fPIC again.
 _PIC_FLAGS = {"-fPIC", "-fpic", "-fPIE", "-fpie", "-fno-pic", "-fno-PIC",
               "-fno-pie", "-fno-PIE"}
+
+
+def _exe_suffix() -> str:
+    """The extension the compiler driver gives an executable.
+
+    gcc on Windows appends .exe when -o names no extension, so an edge
+    declaring "app" produced "app.exe" on disk: ninja never saw its own
+    output, treated the target as dirty and relinked on every build.
+    """
+    return ".exe" if sys.platform == "win32" else ""
+
+
+def _shared_flag() -> str:
+    """The flag that makes the compiler driver emit a shared object.
+
+    macOS links dynamic libraries with -dynamiclib; ELF platforms use
+    -shared. It lives on the rule rather than on each edge so a
+    shared_library target cannot be emitted without it.
+    """
+    return "-dynamiclib" if sys.platform == "darwin" else "-shared"
+
+
+def escape_ninja_path(path) -> str:
+    """Escape a path for use inside a Ninja build statement.
+
+    Ninja's lexer ends the output list at the first unescaped ``:`` and splits
+    on unescaped spaces, so a Windows drive letter or a directory containing a
+    space does not raise an error -- it silently parses into several wrong
+    targets. ``C:\\Users\\Jane Doe\\build\\app.o`` becomes four targets
+    (``C``, ``...\\Jane``, ``Doe``, ``build\\app.o``) instead of one.
+
+    ``$`` is replaced first: the space and colon replacements introduce ``$``
+    characters that must not be escaped again.
+
+    Only the manifest needs this. Ninja shell-quotes ``$in``/``$out`` itself
+    when it builds the command line, so an escaped path still reaches the
+    compiler as a single argument.
+    """
+    return str(path).replace("$", "$$").replace(" ", "$ ").replace(":", "$:")
 
 
 class NinjaBackend:
@@ -104,6 +144,22 @@ class NinjaBackend:
 
         return cflags
 
+    def _object_path(self, target, src: str) -> Path:
+        """Object file path for *src* as compiled by *target*.
+
+        Object paths are namespaced by target name. Two targets may legitimately
+        list the same source: a library and a test binary sharing a helper, or
+        one source built twice with different defines. Each needs its own
+        object, because each compiles with its own cflags. Keying only on the
+        source made both targets claim one output, which ninja rejects with
+        "multiple rules generate ...".
+
+        Example:
+            >>> backend._object_path(target, "src/main.c")   # target.name == "app"
+            PosixPath('_build/obj/app/src/main.o')
+        """
+        return (self.build_dir / "obj" / target.name / src).with_suffix(".o")
+
     def _write_ninja(self) -> None:
         """Write the build.ninja file."""
         ninja_path = self.build_dir / "build.ninja"
@@ -123,13 +179,16 @@ class NinjaBackend:
             "  command = $cc $ldflags $in -o $out $libs",
             "  description = LINK $out",
             "",
-            "rule link_shared",
-            "  command = $cc -shared $ldflags $in -o $out $libs",
-            "  description = LINK_SHARED $out",
-            "",
             "rule ar_rule",
             "  command = $ar rcs $out $in",
             "  description = AR $out",
+            "",
+            # A shared_library edge names this rule. Without the rule the
+            # generated build.ninja referenced an undefined rule and ninja
+            # refused the whole file.
+            "rule link_shared",
+            f"  command = $cc {_shared_flag()} $ldflags $in -o $out $libs",
+            "  description = LINK_SHARED $out",
             "",
         ]
 
@@ -140,16 +199,16 @@ class NinjaBackend:
 
             obj_files = []
             for src in target.sources:
-                obj = str(self._object_path(target, src))
+                obj = escape_ninja_path(self._object_path(target, src))
                 obj_files.append(obj)
                 lines.append(
-                    f"build {obj}: cc {src}"
+                    f"build {obj}: cc {escape_ninja_path(src)}"
                 )
                 if cflags:
                     lines.append(f"  cflags = {' '.join(cflags)}")
                 lines.append("")
 
-            if target.target_type == "executable":
+            if target.target_type in ("executable", "test"):
                 ldflags = toolchain_ldflags + list(target.ldflags)
                 libs = []
                 dep_archives = []
@@ -165,12 +224,15 @@ class NinjaBackend:
                 for dep_name in target.depends:
                     for dep_target in self.config.targets:
                         if dep_target.name == dep_name and dep_target.target_type == "static_library":
-                            dep_archives.append(str(self.build_dir / f"lib{dep_name}.a"))
+                            dep_archives.append(
+                                escape_ninja_path(self.build_dir / f"lib{dep_name}.a")
+                            )
 
                 link_inputs = obj_files + dep_archives
-                out = str(self.build_dir / target.name)
+                out = escape_ninja_path(
+                    self.build_dir / (target.name + _exe_suffix()))
                 lines.append(
-                    f"build {out}: link {' '.join(link_inputs)}"
+                    f"build {out}: link " f"{' '.join(link_inputs)}"
                 )
                 if ldflags:
                     lines.append(f"  ldflags = {' '.join(ldflags)}")
@@ -185,16 +247,16 @@ class NinjaBackend:
                     ext = ".dylib"
                 else:
                     ext = ".so"
-                out = str(self.build_dir / f"lib{target.name}{ext}")
+                out = escape_ninja_path(self.build_dir / f"lib{target.name}{ext}")
 
                 if target.target_type == "static_library":
-                    lines.append(f"build {out}: ar_rule {' '.join(obj_files)}")
+                    lines.append(f"build {out}: ar_rule " f"{' '.join(obj_files)}")
                 else:
-                    # Shared libraries need the platform's "build a shared
-                    # object" flag and the same -L/-l wiring executables get,
-                    # neither of which the generic `link` rule provides.
+                    # Shared libraries need the same -L/-l wiring executables
+                    # get, which the rule preamble alone does not supply. The
+                    # "build a shared object" flag itself lives in the
+                    # link_shared rule, so it must not be repeated here.
                     ldflags = list(target.ldflags)
-                    ldflags.insert(0, "-dynamiclib" if sys.platform == "darwin" else "-shared")
                     libs = []
                     for pkg_name in target.uses:
                         pkg = self.package_paths.get(pkg_name)
@@ -204,7 +266,7 @@ class NinjaBackend:
                             for lib in pkg.libraries:
                                 libs.append(f"-l{lib}")
 
-                    lines.append(f"build {out}: link {' '.join(obj_files)}")
+                    lines.append(f"build {out}: link_shared " f"{' '.join(obj_files)}")
                     if ldflags:
                         lines.append(f"  ldflags = {' '.join(ldflags)}")
                     if libs:

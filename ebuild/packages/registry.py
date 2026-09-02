@@ -9,10 +9,76 @@ package name and version.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ebuild.packages.recipe import PackageRecipe, RecipeError, load_recipe
+
+# Everything from the first '-' or '+' is a suffix: a pre-release tag
+# ("3.6.0-rc1") or build metadata ("1.3.1+patch2").
+_SUFFIX_SPLIT = re.compile(r"[-+]")
+
+# digits then letters: the 1.2.11b patch-respin form.
+_RESPIN = re.compile(r"(\d+)([A-Za-z]+)")
+
+_ComponentKey = Tuple[int, int, str]
+
+
+def _component_key(component: str) -> _ComponentKey:
+    """Order one dot-separated component of a version string.
+
+    Numeric components compare numerically, so 1.10.0 still sorts above
+    1.9.0. Anything else compares as text and ranks below any numeric
+    component, which keeps the ordering total without inventing a meaning
+    for identifiers the recipe format does not define.
+
+    A component that is digits followed by letters -- the patch-respin form
+    zlib and OpenSSL use, 1.2.11b after 1.2.11 -- keeps the numeric rank of
+    its digits and orders on the letters after it, so 1.2.11 < 1.2.11b and
+    1.2.11b < 1.2.11c. Treating it as text instead put it below every
+    numeric component, which sorted the respin *below* the release it
+    supersedes.
+    """
+    if component.isdigit():
+        return (1, int(component), "")
+    respin = _RESPIN.fullmatch(component)
+    if respin:
+        return (1, int(respin.group(1)), respin.group(2))
+    return (0, 0, component)
+
+
+def version_sort_key(version: str) -> tuple:
+    """Sort key for a package version string.
+
+    ``PackageRecipe.validate()`` accepts any non-empty version, and real
+    embedded recipes use more than dotted integers: a leading ``v``
+    (``v2.9.3``, littlefs's own tag format), pre-release tags
+    (``3.6.0-rc1``) and build metadata (``1.3.1+patch2``). Ordering used to
+    be ``[int(x) for x in version.split('.')]``, which raised ValueError on
+    every one of them -- and did so from ``get()``, ``list_packages()`` and
+    ``list_all_versions()``, so a single such recipe anywhere in the
+    registry took down package lookup for the whole project.
+
+    Ordering rules:
+      * an optional leading ``v`` or ``V`` is ignored;
+      * the release part is compared component by component, numerically
+        where a component is all digits;
+      * a version carrying a pre-release or build suffix sorts below the
+        otherwise-equal version without one, so 3.6.0-rc1 < 3.6.0;
+      * nothing raises -- any string has a place in the order.
+    """
+    text = version.strip()
+    if text[:1] in ("v", "V"):
+        text = text[1:]
+
+    parts = _SUFFIX_SPLIT.split(text, maxsplit=1)
+    release = tuple(_component_key(c) for c in parts[0].split("."))
+
+    if len(parts) == 1:
+        return (release, 1, ())
+    suffix = tuple(_component_key(c) for c in re.split(r"[.\-+]", parts[1]))
+    return (release, 0, suffix)
 
 
 class PackageRegistry:
@@ -74,7 +140,7 @@ class PackageRegistry:
         if version:
             return versions.get(version)
 
-        latest_version = sorted(versions.keys(), key=lambda v: [int(x) for x in v.split('.')])[-1]
+        latest_version = sorted(versions.keys(), key=version_sort_key)[-1]
         return versions[latest_version]
 
     def has(self, name: str, version: Optional[str] = None) -> bool:
@@ -86,7 +152,7 @@ class PackageRegistry:
         result = []
         for name in sorted(self._recipes.keys()):
             versions = self._recipes[name]
-            latest = sorted(versions.keys(), key=lambda v: [int(x) for x in v.split('.')])[-1]
+            latest = sorted(versions.keys(), key=version_sort_key)[-1]
             result.append(versions[latest])
         return result
 
@@ -97,7 +163,7 @@ class PackageRegistry:
                 versions[v]
                 for v in sorted(
                     versions.keys(),
-                    key=lambda v: [int(x) for x in v.split(".")],
+                    key=version_sort_key,
                  )
               ]
 
