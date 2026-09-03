@@ -63,7 +63,8 @@ class TestDetectBackend:
         assert detect_backend(tmp_path) == "cmake"
 
 
-# ── BackendDispatcher — unknown backend ─────────────────────
+# ── BackendDispatcher — configure ───────────────────────────
+
 
 class TestConfigureBackends:
     """Verify configure() handles supported backends correctly."""
@@ -76,6 +77,9 @@ class TestConfigureBackends:
         d = BackendDispatcher(tmp_path, tmp_path / "build")
         d.configure(backend)
         mock_sub.run.assert_not_called()
+
+
+# ── BackendDispatcher — unknown backend ─────────────────────
 
 
 class TestUnknownBackend:
