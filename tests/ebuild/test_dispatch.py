@@ -63,22 +63,6 @@ class TestDetectBackend:
         assert detect_backend(tmp_path) == "cmake"
 
 
-# ── BackendDispatcher — configure ───────────────────────────
-
-
-class TestConfigureBackends:
-    """Verify configure() handles supported backends correctly."""
-
-    @pytest.mark.parametrize("backend", ["cargo", "make", "kbuild"])
-    @patch("ebuild.build.dispatch.subprocess")
-    def test_no_configure_backends_are_noop(
-        self, mock_sub, tmp_path, backend
-    ):
-        d = BackendDispatcher(tmp_path, tmp_path / "build")
-        d.configure(backend)
-        mock_sub.run.assert_not_called()
-
-
 # ── BackendDispatcher — unknown backend ─────────────────────
 
 
@@ -220,6 +204,7 @@ class TestUnknownBackendError:
         d = BackendDispatcher(tmp_path, tmp_path / "build")
         with pytest.raises(UnknownBackendError, match="ninja"):
             d.configure("ninja")
+        assert not (tmp_path / "build").exists()
 
     def test_ninja_error_explains_the_targets_requirement(self, tmp_path):
         """The message must be actionable, not just a rejection."""
@@ -243,8 +228,10 @@ class TestUnknownBackendError:
         d = BackendDispatcher(tmp_path, tmp_path / "build")
         d.clean("ninja", dry_run=True)  # must not raise
 
-    def test_no_configure_step_backends_stay_noops(self, tmp_path):
+    @patch("ebuild.build.dispatch.subprocess")
+    def test_no_configure_step_backends_stay_noops(self, mock_sub, tmp_path):
         """cargo/make/kbuild are accepted-and-skipped, not errors."""
         d = BackendDispatcher(tmp_path, tmp_path / "build")
         for backend in ("cargo", "make", "kbuild"):
-            d.configure(backend)  # must not raise
+            d.configure(backend)
+        mock_sub.run.assert_not_called()
